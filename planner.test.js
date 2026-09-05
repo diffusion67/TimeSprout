@@ -1887,4 +1887,3 @@ test('analytics allocation groups scheduled and fixed blocks into stable minute 
     courses: 60, events: 30, tasks: 60, leisure: 30
   });
 });
-
