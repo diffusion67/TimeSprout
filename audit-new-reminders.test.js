@@ -5,6 +5,34 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
+test('Android reminder restoration remains registered for system events but private to other apps', () => {
+  const manifest = fs.readFileSync(path.join(__dirname, 'android/app/src/main/AndroidManifest.xml'), 'utf8');
+  const receiver = manifest.match(/<receiver\b[^>]*android:name="\.RescheduleReceiver"[^>]*>[\s\S]*?<\/receiver>/)?.[0];
+  assert.ok(receiver, 'reschedule receiver must remain registered');
+  assert.match(receiver, /android:exported="false"/, 'other apps must not be able to target the receiver');
+  for (const action of [
+    'android.intent.action.BOOT_COMPLETED',
+    'android.intent.action.TIME_SET',
+    'android.intent.action.TIMEZONE_CHANGED',
+    'android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED'
+  ]) assert.ok(receiver.includes(`android:name="${action}"`), `${action} must still restore reminders`);
+});
+
+test('native reminder synchronization keeps the earliest entries when a plan contains thousands of events', () => {
+  const planner = loadPlanner();
+  const state = planner.normalizeState({
+    settings: { wake: '07:00', sleep: '22:30', play: 0 },
+    events: Array.from({ length: 5000 }, (_, index) => ({
+      id: `event-${index}`, title: 'Event', start: '2030-08-26T09:00:00', end: '2030-08-26T10:00:00'
+    })),
+    tasks: [{ id: 'due-task', title: 'Due task', duration: 10, status: 'pending', due: '2030-08-26T08:30:00' }]
+  });
+  const entries = planner.nativeReminderEntries(state, '2030-08-26T08:00:00');
+  assert.equal(entries.length, 8192);
+  assert.ok(entries.some(entry => entry.id === 'overdue:due-task:2030-08-26T08:30:00'));
+  assert.ok(entries.every((entry, index) => index === 0 || entries[index - 1].at <= entry.at));
+});
+
 test('N02 native reminders include due events through the full 168-hour window', () => {
   const planner = loadPlanner();
   const now = '2026-09-25T09:00:00';

@@ -58,7 +58,7 @@ Tests require a Node.js version that supports `node:test`:
 npm test
 ```
 
-The suite contains 195 Node.js tests covering scheduling, overnight routines, conflicts, localization, backups, native reminders, focus timing, and primary interactions. It also checks navigation, persistence, backup round trips, legacy-data migration, and Chinese and English navigation. `android/tests/` contains a separate JVM reminder regression test that `npm test` does not run.
+The Node.js suite covers scheduling, overnight routines, conflicts, localization, backups, native reminders, focus timing, and primary interactions. It also checks navigation, persistence, backup round trips, legacy-data migration, and Chinese and English navigation. `android/tests/` contains a separate JVM reminder regression test that `npm test` does not run.
 
 ## Data and Privacy
 
@@ -66,6 +66,8 @@ The suite contains 195 Node.js tests covering scheduling, overnight routines, co
 - The app has no account or backend, so data is not automatically synchronized across devices.
 - Clearing browser site data or native app data removes local plans. Export a backup from Settings before doing so.
 - Imported files are validated first and require two confirmations before replacing the current plan.
+- Large plans can still be backed up and restored in full. Automatic planning handles the first 128 tasks for a day and pauses task scheduling when that day has more than 256 fixed blocks. Lists show only the first 256 items; remaining records stay in the plan and backup.
+- If courses and events together exceed 256 records, the global conflict check after an edit reports that it was skipped; Today still counts conflicts among that day's fixed blocks. In-page reminders process up to 512 alerts per cycle; native apps schedule the earliest 8192 system reminders within the next 168 hours.
 - The desktop navigation layout is included in local plans and backups. Older plans default to top navigation to avoid an unexpected layout change after an upgrade.
 - The browser page shows in-page reminders while open. The native apps also schedule local system notifications; they do not transmit plan data.
 

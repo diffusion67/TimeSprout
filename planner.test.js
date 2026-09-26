@@ -1607,6 +1607,120 @@ test('backup parser rejects empty and malformed raw state shapes before normaliz
   assert.deepEqual(planner.parseBackup(`${header}{"courses":[],"tasks":[{"id":"missing-duration","title":"任务"}],"events":[],"holidays":[],"settings":{},"focus":{},"history":[]}`), { ok: false, error: 'invalid-state' });
 });
 
+test('app-created backups with large collections still round trip while planning work is bounded', () => {
+  const planner = loadPlanner();
+  const base = planner.normalizeState({});
+  const roundTrip = state => {
+    const backup = planner.serializeBackup(state);
+    assert.ok(Buffer.byteLength(backup) < 5 * 1024 * 1024);
+    const parsed = planner.parseBackup(backup);
+    assert.equal(parsed.ok, true);
+    return parsed.state;
+  };
+  const task = (index, status = 'pending') => ({
+    id: `task-${index}`, title: 'Task', duration: 1, priority: 'medium', status
+  });
+  const event = index => ({
+    id: `event-${index}`, title: 'Event',
+    start: '2030-08-26T10:00:00', end: '2030-08-26T11:00:00', kind: 'event'
+  });
+  const holiday = index => ({
+    id: `holiday-${index}`, title: 'Break', start: '2030-08-26', end: '2030-08-26', minutes: 45
+  });
+  const activeTasks = Array.from({ length: 129 }, (_, index) => task(index));
+  const taskState = roundTrip({ ...base, settings: { ...base.settings, play: 0 }, tasks: activeTasks });
+  assert.equal(taskState.tasks.length, 129);
+  const plan = planner.planForDate(taskState, '2030-08-26', '2030-08-26T09:00:00');
+  assert.equal(plan.limitedTasks, 1);
+  assert.ok(plan.unscheduled.some(item => item.id === 'task-99'));
+
+  assert.equal(roundTrip({ ...base, tasks: Array.from({ length: 1025 }, (_, index) => task(index, 'completed')) }).tasks.length, 1025);
+  const events = Array.from({ length: 257 }, (_, index) => event(index));
+  const fixedState = roundTrip({ ...base, events });
+  assert.equal(fixedState.events.length, 257);
+  assert.ok(planner.planForDate(fixedState, '2030-08-26', '2030-08-26T09:00:00').limitedFixed > 256);
+  assert.equal(roundTrip({ ...base, holidays: Array.from({ length: 129 }, (_, index) => holiday(index)) }).holidays.length, 129);
+  assert.equal(roundTrip({ ...base, undo: { reason: 'Previous plan', state: { ...base, tasks: activeTasks } } }).undo.state.tasks.length, 129);
+});
+
+test('conflict checks bound detail allocations and do not recount weekly course pairs for long events', () => {
+  const planner = loadPlanner();
+  const courses = Array.from({ length: 64 }, (_, index) => ({
+    id: `course-${index}`, title: 'Course', day: 1, start: '09:00', end: '10:00'
+  }));
+  const events = Array.from({ length: 64 }, (_, index) => ({
+    id: `event-${index}`, title: 'Event', start: '2030-01-01T00:00:00', end: '2031-01-01T00:00:00', kind: 'event'
+  }));
+  const conflicts = planner.findScheduleConflicts(courses, events);
+  assert.equal(conflicts.length, 64 * 63 + 64 * 64);
+  assert.equal(conflicts.truncated, undefined);
+  const keys = new Set(conflicts.map(conflict => [conflict.firstId, conflict.secondId].sort().join('|')));
+  assert.equal(keys.size, conflicts.length);
+  assert.ok(keys.has('course-0|event-0'));
+  assert.equal(planner.findScheduleConflicts([
+    { id: 'monday-1', day: 1, start: '09:00', end: '10:00' },
+    { id: 'monday-2', day: 1, start: '09:30', end: '10:30' }
+  ], [{ id: 'meeting', start: '2030-08-26T09:45:00', end: '2030-08-26T10:15:00' }]).length, 3);
+  const capped = planner.findFixedConflicts(Array.from({ length: 1000 }, (_, index) => ({
+    id: `block-${index}`, start: '2030-08-26T09:00:00', end: '2030-08-26T10:00:00'
+  })), 1000);
+  assert.equal(capped.length, 1000);
+  assert.equal(capped.truncated, true);
+  assert.equal(planner.countFixedConflicts(Array.from({ length: 1000 }, (_, index) => ({
+    id: `block-${index}`, start: '2030-08-26T09:00:00', end: '2030-08-26T10:00:00'
+  }))), 1000 * 999 / 2);
+  const mixed = [
+    { id: 'a', start: '2030-08-26T09:00:00', end: '2030-08-26T10:00:00' },
+    { id: 'b', start: '2030-08-26T09:30:00', end: '2030-08-26T10:30:00' },
+    { id: 'c', start: '2030-08-26T10:30:00', end: '2030-08-26T11:30:00' },
+    { id: 'd', start: '2030-08-26T10:00:00', end: '2030-08-26T11:00:00' }
+  ];
+  assert.equal(planner.countFixedConflicts(mixed), planner.findFixedConflicts(mixed).length);
+  let seed = 17;
+  const next = () => (seed = (seed * 1664525 + 1013904223) >>> 0);
+  const at = minute => `2030-08-26T${String(8 + Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}:00`;
+  for (let sample = 0; sample < 16; sample++) {
+    const blocks = Array.from({ length: 60 }, (_, index) => {
+      const start = next() % 180;
+      return { id: `sample-${sample}-${index}`, start: at(start), end: at(start + 1 + next() % 60) };
+    });
+    assert.equal(planner.countFixedConflicts(blocks), planner.findFixedConflicts(blocks).length);
+  }
+  assert.equal(planner.findScheduleConflicts(courses, Array.from({ length: 257 }, (_, index) => ({
+    id: `many-${index}`, start: '2030-08-26T09:00:00', end: '2030-08-26T10:00:00'
+  }))).skipped, true);
+});
+
+test('Today keeps a large imported plan responsive and explains the display limit', () => {
+  const script = fs.readFileSync(appHtmlPath, 'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
+  const now = new Date();
+  const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const app = { innerHTML: '' };
+  global.localStorage = { getItem: () => JSON.stringify({
+    settings: { language: 'en', play: 0 },
+    events: Array.from({ length: 300 }, (_, index) => ({
+      id: `event-${index}`, title: 'Event', start: `${date}T10:00:00`, end: `${date}T11:00:00`
+    }))
+  }), setItem: () => {} };
+  global.NodeFilter = { SHOW_TEXT: 4 };
+  global.document = {
+    documentElement: {}, activeElement: null, querySelector: () => app, querySelectorAll: () => [],
+    createTreeWalker: () => ({ nextNode: () => null }), addEventListener: () => {}
+  };
+  const originalSetInterval = global.setInterval;
+  global.setInterval = () => 0;
+  try {
+    delete global.AgendaPlanner;
+    eval(script);
+    assert.ok(app.innerHTML.includes('Too many fixed items today'), 'large-plan warning must be visible');
+    assert.ok(app.innerHTML.includes('Showing 256 of'), 'display limit must be visible');
+    assert.ok((app.innerHTML.match(/<article class="block /g) || []).length <= 256);
+  } finally {
+    global.setInterval = originalSetInterval;
+    delete global.document;
+  }
+});
+
 test('backup parser rejects unsafe identifiers and invalid holiday fields', () => {
   const planner = loadPlanner();
   const source = completeBackupState(planner);
