@@ -1,0 +1,25 @@
+{
+  "name": "timesprout-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TimeSprout Windows desktop app",
+  "main": "windows/main.js",
+  "scripts": {
+    "test": "node --test planner.test.js audit-a.test.js audit-b.test.js audit-c.test.js audit-d.test.js audit-new-state.test.js audit-new-reminders.test.js audit-new-backup-dst.test.js audit-new-schedule.test.js audit-f06-f08.test.js audit-new-ui-state.test.js native-reminders-regressions.test.js windows/reminder-store.test.js",
+    "desktop": "electron .",
+    "build:windows": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "top.dffapi.timesprout",
+    "productName": "TimeSprout",
+    "electronDist": "node_modules/electron/dist",
+    "directories": { "output": "dist" },
+    "files": ["index.html", "windows/**/*", "package.json"],
+    "win": { "target": "nsis", "icon": "windows/icon.ico" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true }
+  }
+}

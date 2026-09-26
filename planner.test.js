@@ -6,6 +6,18 @@ const test = require('node:test');
 
 const appHtmlPath = path.join(__dirname, 'index.html');
 
+test('native reminders include system scheduled event start and early warning', () => {
+  const planner = loadPlanner();
+  const state = planner.normalizeState({
+    settings: { wake: '07:00', sleep: '22:30', play: 0, language: 'en' },
+    events: [{ id: 'event-1', title: 'Doctor visit', start: '2026-09-24T10:00:00', end: '2026-09-24T11:00:00', kind: 'locked' }]
+  });
+  const entries = planner.nativeReminderEntries(state, '2026-09-24T09:00:00');
+  const eventEntries = entries.filter(item => item.id.startsWith('event-1:'));
+  assert.deepEqual(eventEntries.map(item => item.at), [new Date('2026-09-24T09:50:00').getTime(), new Date('2026-09-24T10:00:00').getTime()]);
+  assert.ok(eventEntries.every(item => item.body.includes('Doctor visit')));
+});
+
 function loadPlanner(saved) {
   const html = fs.readFileSync(appHtmlPath, 'utf8');
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -80,6 +92,16 @@ function renderedTitle(language) {
 function localDateTime(value) {
   const pad = part => String(part).padStart(2, '0');
   return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}T${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+}
+
+function withFrozenTime(value, callback) {
+  const RealDate = global.Date;
+  const instant = new RealDate(value).getTime();
+  global.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [instant])); }
+    static now() { return instant; }
+  };
+  try { return callback(); } finally { global.Date = RealDate; }
 }
 
 function interactionHarness(saved) {
@@ -211,7 +233,7 @@ function interactionHarness(saved) {
     changeLanguage(value) { dispatch('change', { value, matches: selector => selector === '[data-language]' }); },
     changeTheme(value) { dispatch('change', { value, matches: selector => selector === '[name="theme"]' }); },
     changeBackupFile(file) { dispatch('change', { files: [file], matches: selector => selector === '[data-backup-import]' }); },
-    pressCommand(command) { const button = { dataset: { command }, closest: () => button }; dispatch('click', button); },
+    pressCommand(command, fromConfirmationPanel = false) { const panel = fromConfirmationPanel ? {} : null; const button = { dataset: { command }, closest: selector => selector === '[data-danger-confirmation]' && panel ? panel : button }; dispatch('click', button); },
     pressTaskAction(id, action) { const button = { dataset: { id, act: action }, closest: () => button }; dispatch('click', button); },
     submitForm(type, values) {
       const OriginalFormData = global.FormData;
@@ -318,16 +340,37 @@ test('English translation covers the fixed-conflict alert fragments', () => {
   assert.equal(planner.translate('已自动重排：加入固定事项；发现 2 处固定事项冲突', 'en'), 'Rescheduled: Add fixed event; Found 2 fixed-schedule conflicts');
 });
 
-test('a focus timer tick invalidates a prior undo snapshot while preserving focus progress', () => {
+test('a focus timer tick preserves an available undo snapshot and focus progress', () => {
   const planner = loadPlanner();
+  const undo = { reason: 'Add task', state: {} };
   const result = planner.tickFocusState({
     focus: { running: true, mode: 'focus', remainingSeconds: 1500, lastTick: 1000 },
-    undo: { reason: 'Add task', state: {} }
+    undo
   }, 6000);
 
-  assert.equal(result.state.undo, null);
+  assert.equal(result.state.undo, undo);
   assert.equal(result.state.focus.remainingSeconds, 1495);
   assert.equal(result.state.focus.lastTick, 6000);
+});
+
+test('undo button retains focus time recorded after the plan adjustment', () => {
+  const planner = loadPlanner();
+  const before = planner.normalizeState({
+    analytics: { daily: { '2026-09-25': { completedTaskCount: 0, completedTaskMinutes: 0, focusSeconds: 0 } } }
+  });
+  const current = {
+    ...before,
+    tasks: [{ id: 'added', title: 'Added task', duration: 30, due: '2026-09-25T22:30:00', status: 'pending' }],
+    focus: { ...before.focus, totalSeconds: 60 },
+    analytics: { daily: { '2026-09-25': { completedTaskCount: 0, completedTaskMinutes: 0, focusSeconds: 60 } } },
+    undo: { reason: '添加任务', state: before }
+  };
+  const harness = interactionHarness(current);
+  harness.pressCommand('undo');
+  const saved = JSON.parse(harness.savedWrites.at(-1).value);
+  assert.deepEqual(saved.tasks, []);
+  assert.equal(saved.focus.totalSeconds, 60);
+  assert.equal(saved.analytics.daily['2026-09-25'].focusSeconds, 60);
 });
 
 test('English mode leaves no Chinese in built-in runtime messages', () => {
@@ -369,7 +412,7 @@ test('analytics view renders summary cards, a 30-day control, and an allocation 
   assert.match(harness.markup, /完成率/);
   assert.match(harness.markup, /专注时长/);
   assert.match(harness.markup, /近 30 天/);
-  assert.match(harness.markup, /今日时间分配/);
+  assert.match(harness.markup, /计划时间分配/);
   assert.match(harness.markup, /class="allocationLegend events"/);
   assert.match(harness.markup, /value="2030-01-02"/);
   assert.equal(harness.savedWrites.length, writesBeforeViewChanges);
@@ -554,7 +597,9 @@ test('theme stylesheet confines every color literal to the designated theme-toke
   assert.doesNotMatch(`${nonTokenStyles}\n${inlineStyles}`, /#[\da-f]{3,8}\b|rgba?\(|hsla?\(/i);
 
   const darkTokens = tokenStyles[0][2].match(/html\[data-theme="dark"\]\{([^}]*)\}/)?.[1] || '';
+  const lightTokens = tokenStyles[0][2].match(/:root\{([^}]*)\}/)?.[1] || '';
   const tokenValue = name => darkTokens.match(new RegExp(`${name}:([^;]+)`))?.[1];
+  const lightTokenValue = name => lightTokens.match(new RegExp(`${name}:([^;]+)`))?.[1];
   const contrast = (first, second) => {
     const luminance = color => {
       const channels = color.slice(1).match(/../g).map(value => parseInt(value, 16) / 255).map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
@@ -573,6 +618,10 @@ test('theme stylesheet confines every color literal to the designated theme-toke
 
   for (const [background, foreground] of foregroundPairs) assert.ok(contrast(tokenValue(background), tokenValue(foreground)) >= 4.5, `${foreground} must have at least 4.5:1 contrast on ${background}`);
   for (const [background, border] of borderPairs) assert.ok(contrast(tokenValue(background), tokenValue(border)) >= 3, `${border} must have at least 3:1 contrast on ${background}`);
+  for (const [background, foreground] of foregroundPairs) assert.ok(contrast(lightTokenValue(background), lightTokenValue(foreground)) >= 4.5, `light ${foreground} must have at least 4.5:1 contrast on ${background}`);
+  for (const [background, border] of borderPairs) assert.ok(contrast(lightTokenValue(background), lightTokenValue(border)) >= 3, `light ${border} must have at least 3:1 contrast on ${background}`);
+  assert.ok(contrast(lightTokenValue('--primary'), lightTokenValue('--primary-foreground')) >= 4.5);
+  assert.ok(contrast(tokenValue('--primary'), tokenValue('--primary-foreground')) >= 4.5);
 });
 
 test('theme stylesheet gives conflicted course slots contrast-safe light and dark tokens', () => {
@@ -619,12 +668,12 @@ test('theme stylesheet gives warm and metadata elements semantic dark-mode contr
   assert.match(html, /\.holiday p,\.holiday small\{color:var\(--warm-muted\)\}/);
   assert.match(html, /h1 em,\.guideStep b\{color:var\(--primary\)\}/);
   assert.match(html, /\.eyebrow,\.focusMode\{color:var\(--muted\)\}/);
-  assert.equal(tokenValue(darkTokens, '--warm-surface'), '#33281f');
-  assert.equal(tokenValue(darkTokens, '--warm-accent'), '#ffd18a');
-  assert.equal(tokenValue(darkTokens, '--warm-muted'), '#e5cfac');
-  assert.equal(tokenValue(darkTokens, '--surface'), '#202738');
-  assert.equal(tokenValue(darkTokens, '--primary'), '#92a8ff');
-  assert.equal(tokenValue(darkTokens, '--muted'), '#b6c0d3');
+  assert.equal(tokenValue(darkTokens, '--warm-surface'), '#3d3024');
+  assert.equal(tokenValue(darkTokens, '--warm-accent'), '#ffdbab');
+  assert.equal(tokenValue(darkTokens, '--warm-muted'), '#f0d9bb');
+  assert.equal(tokenValue(darkTokens, '--surface'), '#1e2c23');
+  assert.equal(tokenValue(darkTokens, '--primary'), '#a4dfb9');
+  assert.equal(tokenValue(darkTokens, '--muted'), '#bdcebd');
   assert.ok(contrast(tokenValue(darkTokens, '--warm-surface'), tokenValue(darkTokens, '--warm-accent')) >= 4.5);
   assert.ok(contrast(tokenValue(darkTokens, '--warm-surface'), tokenValue(darkTokens, '--warm-muted')) >= 4.5);
   assert.ok(contrast(tokenValue(darkTokens, '--surface'), tokenValue(darkTokens, '--primary')) >= 4.5);
@@ -652,11 +701,11 @@ test('theme stylesheet gives compact text and leisure charts independent dark to
   assert.match(html, /\.allocation\.leisure,\.allocationLegend\.leisure::before\{background:var\(--chart-leisure\)\}/);
   assert.match(html, /\.icon\{background:var\(--icon-surface\);color:var\(--icon-text\)\}/);
   assert.doesNotMatch(html, /\.allocation\.leisure,\.allocationLegend\.leisure::before\{background:#a277dc\}/);
-  assert.equal(tokenValue('--detail-text'), '#d9e1f2');
-  assert.equal(tokenValue('--overdue-text'), '#ffb4ab');
-  assert.equal(tokenValue('--chart-leisure'), '#cbb8ff');
-  assert.equal(tokenValue('--icon-surface'), '#323d54');
-  assert.equal(tokenValue('--icon-text'), '#e3ebff');
+  assert.equal(tokenValue('--detail-text'), '#dcebdc');
+  assert.equal(tokenValue('--overdue-text'), '#ffb8af');
+  assert.equal(tokenValue('--chart-leisure'), '#dcc0ff');
+  assert.equal(tokenValue('--icon-surface'), '#304638');
+  assert.equal(tokenValue('--icon-text'), '#e5f2e6');
   assert.ok(contrast(tokenValue('--surface'), tokenValue('--detail-text')) >= 4.5);
   assert.ok(contrast(tokenValue('--surface'), tokenValue('--overdue-text')) >= 4.5);
   assert.ok(contrast(tokenValue('--icon-surface'), tokenValue('--icon-text')) >= 4.5);
@@ -717,6 +766,21 @@ test('app shell saves desktop navigation layout while keeping a shared mobile na
   assert.match(harness.markup, /data-mobile-nav/);
 });
 
+test('today, calendar, and sidebar provide dedicated layout regions for rapid scanning', () => {
+  const today = interactionHarness({
+    settings: { wake: '07:00', sleep: '22:30', play: 60, language: 'en', theme: 'system', navigationLayout: 'sidebar' }
+  });
+
+  assert.match(today.markup, /class="todayCommandCenter"/);
+  assert.match(today.markup, /class="sidebarIdentity"/);
+  assert.match(today.markup, /class="sidebarFooter"/);
+
+  today.selectTab('calendar');
+  assert.match(today.markup, /class="calendarWorkspace"/);
+  assert.match(today.markup, /class="[^"]*calendarDetail\b/);
+  assert.doesNotMatch(today.markup, /aria-label="上个月"/);
+});
+
 test('English sidebar and mobile More expose every navigation destination', () => {
   const harness = interactionHarness({
     settings: { wake: '07:00', sleep: '22:30', play: 60, language: 'en', theme: 'system', navigationLayout: 'sidebar' }
@@ -773,6 +837,28 @@ test('runtime reminders select the active language before rendering', () => {
   assert.equal(planner.translate(reminder, 'en'), '09:00 starts soon: 课程');
 });
 
+test('English routine reminders translate built-in schedule titles', () => {
+  const planner = loadPlanner({ settings: { language: 'en' } });
+
+  assert.equal(
+    planner.getReminder(
+      { id: 'wake', kind: 'routine', title: '起床与晨间准备', start: '2030-01-01T09:00:00', end: '2030-01-01T09:15:00' },
+      '2030-01-01T09:00:00'
+    ),
+    'Do now: Wake-up and morning routine'
+  );
+});
+
+test('reminder keys distinguish separate occurrences of a recurring block', () => {
+  const planner = loadPlanner();
+  const wake = { id: 'wake', kind: 'routine', title: '起床与晨间准备', end: '2030-01-01T09:15:00' };
+
+  assert.notEqual(
+    planner.reminderKey({ ...wake, start: '2030-01-01T09:00:00' }, '2030-01-01T08:55:00'),
+    planner.reminderKey({ ...wake, start: '2030-01-02T09:00:00', end: '2030-01-02T09:15:00' }, '2030-01-02T08:55:00')
+  );
+});
+
 test('queued reminder descriptors render in the language selected after enqueueing', () => {
   const planner = loadPlanner();
   const notice = planner.reminderNotice('reminder.overdue', { title: planner.userField('课程') });
@@ -800,6 +886,17 @@ test('generated holiday titles use one renderer across view and reminder paths',
     planner.renderReminderNotice(planner.reminderNotice('reminder.overdue', { title: planner.userField(generated.title), generatedHoliday: true }), 'en'),
     'Task overdue: Break study: 复习 · 08-26'
   );
+});
+
+test('English timeline keeps generated holiday titles as user text', () => {
+  withFrozenTime('2026-09-24T12:00:00', () => {
+    const harness = interactionHarness({
+      tasks: [{ id: 'holiday-task', title: '课程', duration: 30, due: localDateTime(new Date(Date.now() + 24 * 60 * 60 * 1000)), status: 'pending', generatedHoliday: true }],
+      settings: { wake: '00:00', sleep: '23:59', play: 0, language: 'en' }
+    });
+
+    assert.match(harness.markup, /<h3><span data-user-field>Break study: 课程<\/span><\/h3>/);
+  });
 });
 
 test('persisted task titles are never parsed to infer holiday ownership', () => {
@@ -1047,6 +1144,7 @@ test('English static copy ignores matching user titles while notices preserve ma
   const planner = loadPlanner();
   const courseTitle = '课程';
 
+  assert.equal(planner.translate('更多设置：截止时间、优先级、四象限与精确结束时间', 'en'), 'More: due date, priority, quadrants, and an exact end time');
   assert.equal(planner.localizeText('课程、临时事项或正在打卡的任务发生重叠，请调整其中一项。', 'en', [courseTitle], false), 'Courses, events, or active tasks overlap. Adjust one of them.');
   assert.equal(planner.translate(planner.getReminder({ id: 'task-1', kind: 'task', title: courseTitle, start: '2030-01-01T09:00:00', end: '2030-01-01T10:00:00' }, '2030-01-01T09:30:00'), 'en'), 'Do now: 课程');
   const zhPlanner = loadPlanner({ settings: { language: 'zh-CN' } });
@@ -1083,14 +1181,14 @@ test('calendar navigation keeps date-only selections stable west of UTC', () => 
   assert.deepEqual(JSON.parse(output), ['2030-02-15', '2030-02-15']);
 });
 
-test('reminder refresh uses live regions without a full render when no notice is due', () => {
+test('reminder refresh keeps Today live fields updating while editing', () => {
   const planner = loadPlanner();
   const nodes = new Map(['clock', 'currentTitle', 'currentTime', 'nextTitle', 'nextTime', 'pending', 'overdue'].map(key => [key, { textContent: '' }]));
   const root = { querySelector: selector => nodes.get(selector.slice(11, -1)) || null };
 
   assert.equal(planner.reminderRefreshMode(false, false, 'today'), 'live');
   assert.equal(planner.reminderRefreshMode(true, false, 'today'), 'render');
-  assert.equal(planner.reminderRefreshMode(false, true, 'today'), 'none');
+  assert.equal(planner.reminderRefreshMode(false, true, 'today'), 'live');
   assert.equal(planner.updateLiveDashboard(root, { clock: '09:30', currentTitle: '任务', currentTime: '09:00 — 10:00', nextTitle: '暂无安排', nextTime: '留给休息或复习', pending: '2 项', overdue: '1 项已逾期' }), true);
   assert.deepEqual(Object.fromEntries([...nodes].map(([key, node]) => [key, node.textContent])), { clock: '09:30', currentTitle: '任务', currentTime: '09:00 — 10:00', nextTitle: '暂无安排', nextTime: '留给休息或复习', pending: '2 项', overdue: '1 项已逾期' });
 });
@@ -1117,12 +1215,12 @@ test('calendar navigation preserves ordinary days in both directions', () => {
   });
 });
 
-test('reminder refresh mode renders notices, preserves edits, and live-updates Today', () => {
+test('reminder refresh preserves edits and live-updates Today while notices wait', () => {
   const planner = loadPlanner();
 
   assert.equal(planner.refreshMode(false, false, 'today'), 'live');
   assert.equal(planner.refreshMode(true, false, 'today'), 'render');
-  assert.equal(planner.refreshMode(true, true, 'today'), 'none');
+  assert.equal(planner.refreshMode(true, true, 'today'), 'live');
   assert.equal(planner.refreshMode(false, false, 'calendar'), 'none');
 });
 
@@ -1204,15 +1302,17 @@ test('interaction harness keeps a user task title while language controls render
 });
 
 test('interaction harness quiet reminder polling preserves opened advanced settings', () => {
-  const harness = interactionHarness({ settings: { wake: '00:00', sleep: '23:59', play: 0, language: 'en' } });
-  harness.advanced.open = true;
-  const before = harness.renderCount;
+  withFrozenTime('2026-09-24T12:00:00', () => {
+    const harness = interactionHarness({ settings: { wake: '00:00', sleep: '23:59', play: 0, language: 'en' } });
+    harness.advanced.open = true;
+    const before = harness.renderCount;
 
-  harness.runQuietReminderPoll();
+    harness.runQuietReminderPoll();
 
-  assert.equal(harness.renderCount, before);
-  assert.equal(harness.advanced.open, true);
-  assert.ok(harness.liveUpdateCount > 0);
+    assert.equal(harness.renderCount, before);
+    assert.equal(harness.advanced.open, true);
+    assert.ok(harness.liveUpdateCount > 0);
+  });
 });
 
 test('controller interactions use one canonical render entry point', () => {
@@ -1306,7 +1406,7 @@ test('delaying a calendar task moves its scheduling date forward with its due da
     tasks: [{ id: 'calendar-task', title: 'Move me', duration: 30, due: '2026-08-27T22:30:00', date: '2026-08-27', priority: 'medium', status: 'pending' }]
   });
 
-  harness.pressTaskAction('calendar-task', 'delay');
+  withFrozenTime('2026-08-27T12:00:00', () => harness.pressTaskAction('calendar-task', 'delay'));
 
   const saved = JSON.parse(harness.savedWrites.at(-1).value);
   assert.equal(saved.tasks[0].due, '2026-08-28T22:30');
@@ -1335,14 +1435,65 @@ function completeBackupState(planner) {
   });
 }
 
+function expectedImportedBackupState(state) {
+  const imported = structuredClone(state);
+  const pause = focus => ({ ...focus, running: false, startedAt: '', lastTick: 0 });
+  imported.focus = pause(imported.focus);
+  if (imported.undo?.state?.focus) imported.undo.state.focus = pause(imported.undo.state.focus);
+  return imported;
+}
+
 test('backup round trips normalized plan data including history and valid undo snapshots', () => {
   const planner = loadPlanner();
   const state = completeBackupState(planner);
   const text = planner.serializeBackup(state);
 
   assert.match(text, /^TimeSprout backup v2\n/);
-  assert.deepEqual(planner.parseBackup(text), { ok: true, state });
+  assert.deepEqual(planner.parseBackup(text), { ok: true, state: expectedImportedBackupState(state) });
   assert.equal(planner.isValidUndoSnapshot(state.undo), true);
+});
+
+test('R01 zoned backup timestamps become local times before display and reminders', () => {
+  const planner = loadPlanner();
+  const state = completeBackupState(planner);
+  const importState = value => planner.parseBackup(`TimeSprout backup v2\n${JSON.stringify(value)}`);
+  const localDateTime = value => {
+    const date = new Date(value), pad = number => String(number).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  };
+
+  assert.equal(importState({ ...state, tasks: [{ ...state.tasks[0], due: '2030-08-26T20:00' }] }).ok, true);
+  for (const suffix of ['Z', '+08:00']) {
+    const event = { ...state.events[0], start: `2030-08-26T14:00:00${suffix}`, end: `2030-08-26T15:30:00${suffix}` };
+    const imported = importState({ ...state, events: [event] });
+    assert.equal(imported.ok, true);
+    assert.equal(imported.state.events[0].start, localDateTime(event.start));
+    assert.equal(imported.state.events[0].end, localDateTime(event.end));
+    const entries = planner.nativeReminderEntries(imported.state, `${imported.state.events[0].start.slice(0, 10)}T00:00:00`);
+    const start = entries.find(item => item.id === `event:${imported.state.events[0].start}:start`);
+    assert.equal(start?.localAt, imported.state.events[0].start);
+    const importedTask = importState({ ...state, tasks: [{ ...state.tasks[0], due: `2030-08-26T20:00:00${suffix}` }] });
+    assert.equal(importedTask.ok, true);
+    assert.equal(importedTask.state.tasks[0].due, localDateTime(`2030-08-26T20:00:00${suffix}`));
+  }
+  assert.deepEqual(importState({ ...state, events: [{ ...state.events[0], start: '2030-02-30T14:00:00' }] }), { ok: false, error: 'invalid-state' });
+  assert.deepEqual(importState({ ...state, events: [{ ...state.events[0], start: '2030-02-30T14:00:00Z' }] }), { ok: false, error: 'invalid-state' });
+});
+
+test('R01 a previously imported zoned event survives local storage loading', () => {
+  const saved = { settings: { wake: '07:00', sleep: '22:30', play: 0 }, events: [{ id: 'legacy-zoned', title: 'Meeting', start: '2026-09-25T09:00:00Z', end: '2026-09-25T10:00:00Z' }] };
+  const planner = loadPlanner(saved);
+  const date = new Date(saved.events[0].start), pad = number => String(number).padStart(2, '0');
+  const localDay = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const blocks = planner.fixedBlocks(localDay);
+  assert.ok(blocks.some(block => block.id === 'legacy-zoned'), 'upgrading must not silently delete an event accepted by the previous version');
+});
+
+test('R01 timestamp migration keeps backups with no undo field valid', () => {
+  const planner = loadPlanner();
+  const source = completeBackupState(planner);
+  delete source.undo;
+  assert.equal(planner.parseBackup(`TimeSprout backup v2\n${JSON.stringify(source)}`).ok, true);
 });
 
 test('legacy state migrates theme and analytics defaults', () => {
@@ -1362,7 +1513,7 @@ test('v1 backup still imports with default theme and empty analytics', () => {
 
   assert.deepEqual(planner.parseBackup(`TimeSprout backup v1\n${JSON.stringify(legacyState)}`), {
     ok: true,
-    state: planner.normalizeState(legacyState)
+    state: expectedImportedBackupState(planner.normalizeState(legacyState))
   });
 });
 
@@ -1484,7 +1635,10 @@ test('overnight fixed conflicts are evaluated on the planning date', () => {
 
   assert.deepEqual(
     planner.findFixedConflicts(planner.fixedBlocks('2030-08-26')),
-    [{ firstId: 'course-overnight', secondId: 'event-overnight' }]
+    [
+      { firstId: 'course-overnight', secondId: 'event-overnight' },
+      { firstId: 'event-overnight', secondId: 'sleep' }
+    ]
   );
 });
 
@@ -1521,8 +1675,8 @@ test('reset settings and clear plan preserve exactly their documented state rang
   const reset = planner.resetSettingsState(state);
   const cleared = planner.clearPlanState(state);
 
-  assert.deepEqual(reset.settings, { wake: '07:00', sleep: '22:30', play: 60, language: 'en', theme: 'system', navigationLayout: 'top' });
-  assert.deepEqual(reset.focus, { taskId: '', mode: 'focus', running: false, remainingSeconds: 1500, startedAt: '', completedPomodoros: 0, totalSeconds: 0, lastTick: 0 });
+  assert.deepEqual(reset.settings, { ...state.settings, wake: '07:00', sleep: '22:30', play: 60 });
+  assert.deepEqual(reset.focus, state.focus);
   assert.deepEqual(reset.courses, state.courses);
   assert.deepEqual(reset.tasks, state.tasks);
   assert.deepEqual(reset.events, state.events);
@@ -1544,7 +1698,7 @@ test('danger confirmations advance only after two matching actions', () => {
   const planner = loadPlanner();
 
   assert.deepEqual(planner.advanceDangerConfirmation(null, 'clear-plan'), { action: 'clear-plan', stage: 1 });
-  assert.deepEqual(planner.advanceDangerConfirmation({ action: 'clear-plan', stage: 1 }, 'clear-plan'), { action: 'clear-plan', stage: 2 });
+  assert.deepEqual(planner.advanceDangerConfirmation({ action: 'clear-plan', stage: 1 }, 'clear-plan', true), { action: 'clear-plan', stage: 2 });
   assert.equal(planner.advanceDangerConfirmation({ action: 'clear-plan', stage: 1 }, 'cancel'), null);
   assert.equal(planner.advanceDangerConfirmation({ action: 'clear-plan', stage: 1 }, 'reset-settings'), null);
 });
@@ -1566,7 +1720,7 @@ test('destructive settings controls stage before save and execute only on a matc
     if (command === 'reset-settings') assert.match(harness.markup, /value="06:30"/, 'stage one must leave routine state unchanged');
     else assert.match(harness.markup, /Add task/, 'stage one must leave plan history unchanged');
 
-    harness.pressCommand(command);
+    harness.pressCommand(command, true);
     assert.equal(harness.savedWrites.length, 1, `${command} must save once after stage two`);
     const saved = JSON.parse(harness.savedWrites[0].value);
     if (command === 'reset-settings') assert.deepEqual(expected(saved), { wake: '07:00', sleep: '22:30', play: 60, language: 'en', theme: 'system', navigationLayout: 'top' });
@@ -1795,7 +1949,7 @@ test('leisure-only completion preserves task status without creating completion 
   assert.equal(summary.taskTrend.at(-1).value, 0);
 });
 
-test('completed focus rounds record exactly one pomodoro on the planning date', () => {
+test('focus completion records only elapsed focus seconds on the planning date', () => {
   const planner = loadPlanner();
   const source = planner.normalizeState({
     settings: { wake: '20:00', sleep: '06:00' },
@@ -1806,7 +1960,7 @@ test('completed focus rounds record exactly one pomodoro on the planning date', 
   const breakTick = planner.tickFocusState(completed, Date.parse('2030-01-02T01:00:01')).state;
 
   assert.deepEqual(completed.analytics.daily['2030-01-01'], {
-    completedTaskCount: 0, completedTaskMinutes: 0, focusSeconds: 1500
+    completedTaskCount: 0, completedTaskMinutes: 0, focusSeconds: 1
   });
   assert.deepEqual(breakTick.analytics.daily['2030-01-01'], completed.analytics.daily['2030-01-01']);
 });
