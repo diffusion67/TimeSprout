@@ -7,7 +7,7 @@ const test = require('node:test');
 const appHtmlPath = path.join(__dirname, 'index.html');
 
 function loadBackupUi() {
-  const html = fs.readFileSync(appHtmlPath, 'utf8');
+  const html = fs.readFileSync(appHtmlPath, 'utf8').replace(/\r\n/g, '\n');
   let script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   script = script.replace(
     'function showBackupNotice(key){notice=message(key,{},activeLanguage());renderApp()}',

@@ -6,7 +6,7 @@ const test = require('node:test');
 const appHtmlPath = path.join(__dirname, 'index.html');
 
 function loadPlanner(saved, { storageWrite, native, instrumentSync = false, instrumentState = false } = {}) {
-  const html = fs.readFileSync(appHtmlPath, 'utf8');
+  const html = fs.readFileSync(appHtmlPath, 'utf8').replace(/\r\n/g, '\n');
   let script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   if (instrumentSync) script = script.replace('finally{syncNativeReminders()}', 'finally{globalThis.__syncCalls=(globalThis.__syncCalls||0)+1}');
   if (instrumentState) script = script.replace('function save(){', 'globalThis.__auditState={get:()=>state,notice:()=>notice};function save(){');
@@ -23,7 +23,7 @@ function loadPlanner(saved, { storageWrite, native, instrumentSync = false, inst
 }
 
 function loadBackupUi(saved, native) {
-  const html = fs.readFileSync(appHtmlPath, 'utf8');
+  const html = fs.readFileSync(appHtmlPath, 'utf8').replace(/\r\n/g, '\n');
   let script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   script = script.replace('function renderApp(){', 'function renderApp(){return;');
   script = script.replace(
