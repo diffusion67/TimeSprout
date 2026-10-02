@@ -1,0 +1,221 @@
+name: Build installers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64 installer
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run application regression tests
+        timeout-minutes: 3
+        run: npm test
+      - name: Build unsigned Windows x64 installer
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run build:windows -- --x64 --publish never '--config.artifactName=TimeSprout-${version}-windows-${arch}-setup.${ext}'
+      - name: Verify packaged application sources
+        shell: bash
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const asar = require('@electron/asar');
+          const archive = 'dist/win-unpacked/resources/app.asar';
+          for (const file of ['index.html', 'windows/main.js', 'windows/preload.js', 'windows/reminder-store.js', 'windows/icon.png']) {
+            assert.deepEqual(asar.extractFile(archive, file), fs.readFileSync(file), `Packaged ${file} differs from source`);
+          }
+          const packaged = JSON.parse(asar.extractFile(archive, 'package.json'));
+          assert.equal(packaged.version, '1.0.0');
+          assert.equal(packaged.main, 'windows/main.js');
+          assert.ok(fs.statSync('dist/TimeSprout-1.0.0-windows-x64-setup.exe').size > 1000000);
+          console.log('Windows archive contains the exact checked-out app sources and version');
+          NODE
+      - name: Install and launch on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path 'dist/TimeSprout-1.0.0-windows-x64-setup.exe').Path
+          $signature = Get-AuthenticodeSignature $installer
+          if ($signature.Status -ne 'NotSigned') { throw "Unexpected installer signature state: $($signature.Status)" }
+          $installDir = Join-Path $env:RUNNER_TEMP 'TimeSprout-smoke'
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer exited with $($install.ExitCode)" }
+          $exe = Join-Path $installDir 'TimeSprout.exe'
+          if (!(Test-Path $exe)) { throw 'Installed executable is missing' }
+          $archive = Join-Path $installDir 'resources/app.asar'
+          if ((Get-FileHash $archive).Hash -ne (Get-FileHash 'dist/win-unpacked/resources/app.asar').Hash) {
+            throw 'Installed archive differs from the verified build'
+          }
+          try {
+            Start-Process -FilePath $exe | Out-Null
+            $visible = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Seconds 1
+              $processes = @(Get-Process TimeSprout -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe })
+              if ($processes | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq 'TimeSprout' -and $_.Responding }) {
+                $visible = $true
+                break
+              }
+            }
+            if (!$visible) { throw 'Installed application did not show a responsive TimeSprout window' }
+            Write-Output 'Unsigned NSIS installation and native Windows launch smoke test passed'
+          } finally {
+            Get-Process TimeSprout -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installer
+          path: dist/TimeSprout-1.0.0-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Verify preinstalled Android SDK
+        run: |
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt"
+      - name: Run standalone JVM regression tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/timesprout-jvm"
+          javac -d "$RUNNER_TEMP/timesprout-jvm" \
+            android/app/src/main/java/top/dffapi/timesprout/ReminderReplacementTransaction.java \
+            android/app/src/main/java/top/dffapi/timesprout/ReminderIdentity.java \
+            android/tests/ReminderReplacementTransactionTest.java
+          java -cp "$RUNNER_TEMP/timesprout-jvm" top.dffapi.timesprout.ReminderReplacementTransactionTest
+      - name: Build debug-signed APK and run Android lint
+        working-directory: android
+        run: ./gradlew --no-daemon assembleDebug lintDebug
+      - name: Verify APK contents, metadata, alignment, and debug signature
+        shell: bash
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee "$RUNNER_TEMP/apk-signature.txt"
+          grep -q 'CN=Android Debug' "$RUNNER_TEMP/apk-signature.txt"
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 4 "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee "$RUNNER_TEMP/apk-metadata.txt"
+          grep -q "package: name='top.dffapi.timesprout' versionCode='1' versionName='1.0.0'" "$RUNNER_TEMP/apk-metadata.txt"
+          grep -q "sdkVersion:'24'" "$RUNNER_TEMP/apk-metadata.txt"
+          grep -q "targetSdkVersion:'34'" "$RUNNER_TEMP/apk-metadata.txt"
+          python3 <<'PY'
+          import pathlib, zipfile
+          with zipfile.ZipFile('android/app/build/outputs/apk/debug/app-debug.apk') as apk:
+              assert apk.testzip() is None, 'APK ZIP integrity check failed'
+              assert apk.read('assets/index.html') == pathlib.Path('index.html').read_bytes(), 'Packaged HTML differs from source'
+              assert 'classes.dex' in apk.namelist(), 'Android application classes missing'
+              assert 'AndroidManifest.xml' in apk.namelist(), 'Android manifest missing'
+          print('APK integrity and exact embedded application source verified')
+          PY
+          mkdir -p dist
+          cp "$APK" dist/TimeSprout-1.0.0-android-debug.apk
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-apk
+          path: dist/TimeSprout-1.0.0-android-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish requested v1.0.0 prerelease
+    needs: [windows, android]
+    if: github.repository == 'diffusion67/TimeSprout' && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release v1.0.0]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-installer
+          path: release-assets
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: android-apk
+          path: release-assets
+      - name: Publish verified installers and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        working-directory: release-assets
+        run: |
+          test -s TimeSprout-1.0.0-windows-x64-setup.exe
+          test -s TimeSprout-1.0.0-android-debug.apk
+          sha256sum TimeSprout-1.0.0-windows-x64-setup.exe TimeSprout-1.0.0-android-debug.apk > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+          # A draft need not have a tag yet. Check both, and fail closed on API errors.
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == "v1.0.0") | .id' > "$RUNNER_TEMP/existing-releases.txt"
+          if test -s "$RUNNER_TEMP/existing-releases.txt"; then
+            echo 'v1.0.0 release already exists; refusing to overwrite it' >&2
+            exit 1
+          fi
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/existing-tag.json" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            "$GITHUB_API_URL/repos/$GH_REPO/git/ref/tags/v1.0.0")
+          if test "$status" != 404; then
+            echo "Expected absent v1.0.0 tag (HTTP 404), received HTTP $status; refusing to continue" >&2
+            exit 1
+          fi
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## TimeSprout 1.0.0 installation builds
+
+          Built from commit $GITHUB_SHA. Application features and local data format are unchanged.
+
+          - **Windows x64:** TimeSprout-1.0.0-windows-x64-setup.exe is an unsigned NSIS installer. Windows may show an unknown-publisher/SmartScreen warning. CI checked the packaged sources, silently installed it, and launched a responsive native window on Windows Server 2022.
+          - **Android 7.0+:** TimeSprout-1.0.0-android-debug.apk uses an automatically generated, ephemeral Android debug signing key. It is a testing/sideload build, not a production-signed or Play Store release. CI checked Android lint, APK metadata, ZIP integrity, embedded HTML, alignment, and signature. It has not been tested on a physical Android device.
+          - **Back up first:** Export important plans in Settings before replacing an existing installation. Android builds signed with a different key cannot update one another in place; uninstalling removes local plans. This build does not preserve the ephemeral signing key for future updates.
+          - The Node regression suite and standalone JVM reminder checks passed. Native notification delivery, sound, and real-device permission flows still depend on the operating system and were not end-to-end tested.
+          - SHA256SUMS.txt contains the installer hashes. The browser version remains available as index.html in the source.
+
+          [Build and verification logs](https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID)
+          EOF
+          gh release create v1.0.0 \
+            --target "$GITHUB_SHA" \
+            --title 'TimeSprout 1.0.0 — Windows and Android test builds' \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --draft \
+            --prerelease \
+            TimeSprout-1.0.0-windows-x64-setup.exe \
+            TimeSprout-1.0.0-android-debug.apk \
+            SHA256SUMS.txt
+          mkdir "$RUNNER_TEMP/release-download-check"
+          gh release download v1.0.0 --dir "$RUNNER_TEMP/release-download-check"
+          cd "$RUNNER_TEMP/release-download-check"
+          sha256sum --check SHA256SUMS.txt
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          gh release edit v1.0.0 --draft=false
+          test "$(gh release view v1.0.0 --json isDraft --jq '.isDraft')" = false
